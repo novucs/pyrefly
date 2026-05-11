@@ -1951,9 +1951,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         index
     }
 
-    fn cycles(&self) -> &Cycles {
-        &self.thread_state.cycles
-    }
     /// Access the thread-local state for trace recording.
     pub(crate) fn trace_state(&self) -> &ThreadState {
         self.thread_state
