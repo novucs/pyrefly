@@ -773,24 +773,26 @@ def test_alias_hiding_any_consumed(x: Alias) -> None:
 );
 
 testcase!(
-    test_isinstance_dynamic_classinfo_narrows_to_any,
+    test_isinstance_dynamic_classinfo_does_not_widen,
     r#"
-from typing import Any, assert_type, reveal_type
+from typing import Any, reveal_type
 
 class A: ...
 class B: ...
 
-def test_dynamic_classinfo_narrows_to_any(x: A, cls: Any) -> None:
+# An unknown class object (`Any` or `type[Any]`) gives no concrete runtime
+# evidence, so it must not widen the subject's type.
+def test_dynamic_classinfo(x: A, cls: Any) -> None:
     if isinstance(x, cls):
-        assert_type(x, Any)
+        reveal_type(x)  # E: revealed type: A
         if isinstance(x, B):
-            reveal_type(x)  # E: revealed type: B
+            reveal_type(x)  # E: revealed type: A & B
 
-def test_type_any_classinfo_narrows_to_any(x: A, cls: type[Any]) -> None:
+def test_type_any_classinfo(x: A, cls: type[Any]) -> None:
     if isinstance(x, cls):
-        assert_type(x, Any)
+        reveal_type(x)  # E: revealed type: A
         if isinstance(x, B):
-            reveal_type(x)  # E: revealed type: B
+            reveal_type(x)  # E: revealed type: A & B
     "#,
 );
 
