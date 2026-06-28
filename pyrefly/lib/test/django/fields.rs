@@ -6,6 +6,9 @@
  */
 
 use crate::django_testcase;
+use crate::test::django::util::django_env;
+use crate::test::util::TestEnv;
+use crate::testcase;
 
 django_testcase!(
     test_textfield_nullable,
@@ -101,6 +104,64 @@ class NotificationQuerySet(models.QuerySet["Notification"]):
 class Notification(models.Model):
     resolved_at = models.DateTimeField(null=True, blank=True)
     objects = NotificationQuerySet.as_manager()
+
+Notification.objects.resolved()
+Notification.objects.all().resolved()
+"#,
+);
+
+// Same as above, but the manager is created once at module level and assigned to
+// `objects` through a name. This is the common `Manager = QS.as_manager()` pattern.
+django_testcase!(
+    test_queryset_as_manager_through_alias_preserves_custom_methods,
+    r#"
+from django.db import models
+
+class NotificationQuerySet(models.QuerySet["Notification"]):
+    def resolved(self):
+        return self.filter(resolved_at__isnull=False)
+
+NotificationManager = NotificationQuerySet.as_manager()
+
+class Notification(models.Model):
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    objects = NotificationManager
+
+Notification.objects.resolved()
+Notification.objects.all().resolved()
+"#,
+);
+
+fn django_env_with_manager_module() -> TestEnv {
+    let mut env = django_env();
+    env.add(
+        "managers",
+        r#"
+from django.db import models
+
+class NotificationQuerySet(models.QuerySet):
+    def resolved(self):
+        return self.filter(resolved_at__isnull=False)
+
+NotificationManager = NotificationQuerySet.as_manager()
+"#,
+    );
+    env
+}
+
+// The manager is defined and created in a *separate* module and imported, which is
+// the most common real-world shape. The imported manager must still expose the
+// queryset's custom methods on `objects`.
+testcase!(
+    test_queryset_as_manager_imported_preserves_custom_methods,
+    django_env_with_manager_module(),
+    r#"
+from django.db import models
+from managers import NotificationManager
+
+class Notification(models.Model):
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    objects = NotificationManager
 
 Notification.objects.resolved()
 Notification.objects.all().resolved()
