@@ -309,6 +309,15 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         || metadata.is_factory_boy_factory()
                 });
 
+        let is_drf_serializer = bases_with_metadata
+            .iter()
+            .any(|(base_class_object, metadata)| {
+                base_class_object.has_toplevel_qname(
+                    ModuleName::rest_framework_serializers().as_str(),
+                    "BaseSerializer",
+                ) || metadata.is_drf_serializer()
+            });
+
         let is_metaclass = bases_with_metadata
             .iter()
             .any(|(base_class_object, metadata)| {
@@ -549,6 +558,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             django_model_metadata,
             is_marshmallow_schema,
             is_factory_boy_factory,
+            is_drf_serializer,
             is_metaclass,
             explicit_slots,
             capture_init.map(|names| names.to_vec()),
