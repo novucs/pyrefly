@@ -2584,6 +2584,13 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         range: TextRange,
         errors: &ErrorCollector,
     ) {
+        // factory_boy declaration methods (e.g. `@post_generation`) receive the
+        // generated model instance as `self`, not the factory, so an explicit
+        // `self: Model` annotation is correct and must not be validated against the
+        // factory class.
+        if self.get_metadata_for_class(cls).is_factory_boy_factory() {
+            return;
+        }
         if let Params::List(param_list) = &callable.params
             && let Some(Param::PosOnly(_, self_ty, _) | Param::Pos(_, self_ty, _)) =
                 param_list.items().first()
