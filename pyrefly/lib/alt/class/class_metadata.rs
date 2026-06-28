@@ -447,7 +447,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 })
             });
         let dataclass_transform_metadata = self.dataclass_transform_metadata(
-            &keywords,
+            &keyword_annotations,
             &decorators,
             metaclass,
             dataclass_defaults_from_base_class.clone(),
