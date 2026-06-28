@@ -683,6 +683,9 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 if let Some(ty) = self.synthesized_functional_class_type(x) {
                     return ty;
                 }
+                if let Some(ty) = self.django_queryset_as_manager_return(x) {
+                    return ty;
+                }
                 let callee_ty = self.expr_infer(&x.func, errors);
                 self.check_pytorch_tensor_item_call(x, &callee_ty, errors);
                 self.check_pytorch_tensor_cuda_call(x, &callee_ty, errors);

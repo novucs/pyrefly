@@ -244,6 +244,36 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 .any(|ancestor| ancestor.has_qname("django.db.models.query", "QuerySet"))
     }
 
+    /// If `call` is `SomeQuerySet.as_manager()` where `SomeQuerySet` subclasses
+    /// Django's `QuerySet`, return the queryset instance type.
+    ///
+    /// The stubs type `as_manager()` as `-> Manager[Model]`, which drops the
+    /// queryset's custom methods. Modeling the result as the queryset instead keeps
+    /// them visible (mypy's Django plugin does the equivalent by synthesizing a
+    /// manager that proxies the queryset). Resolving this at the call site — rather
+    /// than only at the `objects = ...` assignment — lets the result flow through a
+    /// name binding, including one imported from another module.
+    pub fn django_queryset_as_manager_return(&self, call: &ExprCall) -> Option<Type> {
+        let Expr::Attribute(attr) = call.func.as_ref() else {
+            return None;
+        };
+        if attr.attr.id != AS_MANAGER {
+            return None;
+        }
+        match self.expr_infer(&attr.value, &self.error_swallower()) {
+            Type::ClassDef(queryset_cls) if self.inherits_from_django_queryset(&queryset_cls) => {
+                Some(self.instantiate(&queryset_cls))
+            }
+            _ => None,
+        }
+    }
+
+    /// Type of a model's `objects` (or other manager) field when it is assigned a
+    /// `QuerySet.as_manager()` result, directly or through a name (possibly
+    /// imported). The value's type is the queryset instance (see
+    /// [`Self::django_queryset_as_manager_return`]); returning it here uses it as
+    /// the field type so the queryset's custom methods stay visible and it
+    /// overrides the inherited `objects: Manager[Self]` annotation.
     pub fn get_django_manager_from_queryset_type(
         &self,
         model: &Class,
@@ -252,17 +282,12 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         if !self.get_metadata_for_class(model).is_django_model() {
             return None;
         }
-        let call_expr = initial_value_expr?.as_call_expr()?;
-        let Expr::Attribute(attr) = call_expr.func.as_ref() else {
-            return None;
-        };
-        if attr.attr.id != AS_MANAGER {
-            return None;
-        }
-
-        match self.expr_infer(&attr.value, &self.error_swallower()) {
-            Type::ClassDef(queryset_cls) if self.inherits_from_django_queryset(&queryset_cls) => {
-                Some(self.instantiate(&queryset_cls))
+        let ty = self.expr_infer(initial_value_expr?, &self.error_swallower());
+        match &ty {
+            Type::ClassType(class_type)
+                if self.inherits_from_django_queryset(class_type.class_object()) =>
+            {
+                Some(ty)
             }
             _ => None,
         }
