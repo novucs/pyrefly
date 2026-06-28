@@ -5396,52 +5396,13 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 None => self.heap.mk_any_implicit(),
                 Some(cls) => {
                     let mut ty = self.heap.mk_class_def(cls.dupe());
-                    if !self.module().path().is_interface() {
-                        for decorator_key in decorators.iter().rev() {
-                            let decorator = self.get_idx(*decorator_key);
-                            if decorator.ty.dataclass_transform_metadata().is_some()
-                                || matches!(
-                                    &decorator.ty,
-                                    Type::KwCall(call)
-                                        if call.has_function_kind(FunctionKind::DataclassTransform)
-                                            || call
-                                                .func_metadata
-                                                .flags
-                                                .dataclass_transform_metadata
-                                                .is_some()
-                                )
-                            {
-                                continue;
-                            }
-                            let range = self.bindings().idx_to_key(*decorator_key).range();
-                            let call_target = self.as_call_target_or_error(
-                                decorator.ty.clone(),
-                                CallStyle::FreeForm,
-                                range,
-                                errors,
-                                None,
-                            );
-                            let arg = CallArg::ty(&ty, range);
-                            let decorated_ty = self.call_infer(
-                                call_target,
-                                &[arg],
-                                &[],
-                                range,
-                                errors,
-                                None,
-                                None,
-                                None,
-                            );
-                            if decorated_ty.is_toplevel_callable()
-                                || self
-                                    .untype_opt(decorated_ty.clone(), range, errors)
-                                    .is_some()
-                            {
-                                ty = self.heap.mk_class_def(cls.dupe());
-                            } else {
-                                ty = decorated_ty;
-                            }
+                    for decorator_key in decorators.iter().rev() {
+                        if self.bindings().get(*decorator_key).is_class_metadata {
+                            continue;
                         }
+                        let decorator = self.get_idx(*decorator_key);
+                        let range = self.bindings().idx_to_key(*decorator_key).range();
+                        ty = self.apply_class_decorator(decorator.ty.clone(), ty, range, errors);
                     }
                     ty
                 }
