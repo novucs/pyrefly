@@ -279,12 +279,54 @@ pub(crate) const MAX_TUPLE_LENGTH: usize = 256;
 
 impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
     fn synthesized_functional_class_type(&self, call: &ExprCall) -> Option<Type> {
+        // Manager classes synthesized for `as_manager()`/`from_queryset()` are also
+        // bound to the anon key, but are handled by `django_manager_call` (which
+        // returns an instance for `as_manager`); skip them here.
+        if let Expr::Attribute(attr) = call.func.as_ref()
+            && (attr.attr.id == "as_manager" || attr.attr.id == "from_queryset")
+        {
+            return None;
+        }
         let anon_key = Key::Anon(call.range);
         let idx = self
             .bindings()
             .key_to_idx_hashed_opt(Hashed::new(&anon_key))?;
         matches!(self.bindings().get(idx), Binding::ClassDef(..))
             .then(|| self.get_hashed(Hashed::new(&anon_key)).ty().clone())
+    }
+
+    /// Type of `SomeQuerySet.as_manager()` / `Manager.from_queryset(SomeQuerySet)`,
+    /// using the manager class synthesized at bind time (bound to the call's anon key).
+    /// Returns an instance for `as_manager()` and the class object for `from_queryset()`,
+    /// or `None` when the receiver/argument isn't a Django queryset (so the call resolves
+    /// normally).
+    fn django_manager_call(&self, call: &ExprCall) -> Option<Type> {
+        let Expr::Attribute(attr) = call.func.as_ref() else {
+            return None;
+        };
+        let is_as_manager = attr.attr.id == "as_manager";
+        if !is_as_manager && attr.attr.id != "from_queryset" {
+            return None;
+        }
+        let anon_key = Key::Anon(call.range);
+        let idx = self
+            .bindings()
+            .key_to_idx_hashed_opt(Hashed::new(&anon_key))?;
+        if !matches!(self.bindings().get(idx), Binding::ClassDef(..)) {
+            return None;
+        }
+        let class_ty = self.get_hashed(Hashed::new(&anon_key)).ty().clone();
+        let Type::ClassDef(manager_cls) = &class_ty else {
+            return None;
+        };
+        // Only treat it as a manager if the base resolved to a real queryset.
+        self.get_metadata_for_class(manager_cls)
+            .django_manager_from_queryset()?;
+        if is_as_manager {
+            Some(self.instantiate(manager_cls))
+        } else {
+            Some(class_ty)
+        }
     }
 
     /// Infer a type for an expression, with an optional type hint that influences the inferred type.
@@ -680,10 +722,10 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             Expr::YieldFrom(x) => self.get(&KeyYieldFrom(x.range)).return_ty.clone(),
             Expr::Compare(x) => self.compare_infer(x, errors),
             Expr::Call(x) => {
-                if let Some(ty) = self.synthesized_functional_class_type(x) {
+                if let Some(ty) = self.django_manager_call(x) {
                     return ty;
                 }
-                if let Some(ty) = self.django_queryset_as_manager_return(x) {
+                if let Some(ty) = self.synthesized_functional_class_type(x) {
                     return ty;
                 }
                 let callee_ty = self.expr_infer(&x.func, errors);

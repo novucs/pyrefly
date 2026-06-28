@@ -92,9 +92,13 @@ assert_type(total_sum_typed, dict[str, Any])
 "#,
 );
 
+// `QuerySet.as_manager()` is modeled as a *manager* (not the queryset): the queryset's
+// own methods are grafted on (returning the queryset), the standard manager API keeps
+// the precise model, and — soundly — the manager is NOT iterable/subscriptable.
 django_testcase!(
-    test_queryset_as_manager_preserves_custom_methods,
+    test_queryset_as_manager_is_sound_manager,
     r#"
+from typing import assert_type
 from django.db import models
 
 class NotificationQuerySet(models.QuerySet["Notification"]):
@@ -105,16 +109,28 @@ class Notification(models.Model):
     resolved_at = models.DateTimeField(null=True, blank=True)
     objects = NotificationQuerySet.as_manager()
 
-Notification.objects.resolved()
-Notification.objects.all().resolved()
+# Custom queryset method is available on the manager and returns the queryset.
+assert_type(Notification.objects.resolved(), NotificationQuerySet)
+assert_type(Notification.objects.resolved().resolved(), NotificationQuerySet)
+# Standard queryset methods return the custom queryset, so chaining a custom method works.
+assert_type(Notification.objects.all(), NotificationQuerySet)
+assert_type(Notification.objects.all().resolved(), NotificationQuerySet)
+# Methods keep the precise model.
+assert_type(Notification.objects.get(), Notification)
+# A manager is not a queryset: iteration and subscription are rejected.
+for n in Notification.objects:  # E: is not iterable
+    pass
+Notification.objects[0]  # E: Cannot index into
 "#,
 );
 
-// Same as above, but the manager is created once at module level and assigned to
-// `objects` through a name. This is the common `Manager = QS.as_manager()` pattern.
+// The manager is created once at module level and assigned to `objects` through a name —
+// the common `Manager = QS.as_manager()` pattern. The synthesized manager type flows
+// through the name binding.
 django_testcase!(
-    test_queryset_as_manager_through_alias_preserves_custom_methods,
+    test_queryset_as_manager_through_alias,
     r#"
+from typing import assert_type
 from django.db import models
 
 class NotificationQuerySet(models.QuerySet["Notification"]):
@@ -127,8 +143,9 @@ class Notification(models.Model):
     resolved_at = models.DateTimeField(null=True, blank=True)
     objects = NotificationManager
 
-Notification.objects.resolved()
-Notification.objects.all().resolved()
+assert_type(Notification.objects.resolved(), NotificationQuerySet)
+assert_type(Notification.objects.get(), Notification)
+Notification.objects[0]  # E: Cannot index into
 "#,
 );
 
@@ -149,21 +166,45 @@ NotificationManager = NotificationQuerySet.as_manager()
     env
 }
 
-// The manager is defined and created in a *separate* module and imported, which is
-// the most common real-world shape. The imported manager must still expose the
-// queryset's custom methods on `objects`.
+// The manager is defined and created in a *separate* module and imported — the most
+// common real-world shape. The imported manager still exposes the queryset's methods
+// and stays a (non-iterable) manager.
 testcase!(
-    test_queryset_as_manager_imported_preserves_custom_methods,
+    test_queryset_as_manager_imported,
     django_env_with_manager_module(),
     r#"
+from typing import assert_type
 from django.db import models
-from managers import NotificationManager
+from managers import NotificationManager, NotificationQuerySet
 
 class Notification(models.Model):
     resolved_at = models.DateTimeField(null=True, blank=True)
     objects = NotificationManager
 
-Notification.objects.resolved()
-Notification.objects.all().resolved()
+assert_type(Notification.objects.resolved(), NotificationQuerySet)
+for n in Notification.objects:  # E: is not iterable
+    pass
+"#,
+);
+
+// `Manager.from_queryset(QS)` yields the manager *class*; instances expose the
+// queryset's methods and are not iterable.
+django_testcase!(
+    test_manager_from_queryset,
+    r#"
+from typing import assert_type
+from django.db import models
+
+class NotificationQuerySet(models.QuerySet["Notification"]):
+    def resolved(self):
+        return self.filter(resolved_at__isnull=False)
+
+class Notification(models.Model):
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    objects = models.Manager.from_queryset(NotificationQuerySet)()
+
+assert_type(Notification.objects.resolved(), NotificationQuerySet)
+assert_type(Notification.objects.get(), Notification)
+Notification.objects[0]  # E: Cannot index into
 "#,
 );

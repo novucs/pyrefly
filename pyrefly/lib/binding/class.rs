@@ -102,6 +102,7 @@ enum SynthesizedClassKind {
     TypedDict,
     NamedTuple,
     NewType,
+    DjangoManager,
 }
 
 /// Right-align `default_elts` into `defaults`: a slice of N elements makes the last N fields
@@ -1487,6 +1488,42 @@ impl<'a> BindingsBuilder<'a> {
             SynthesizedClassKind::NamedTuple,
             Some(BaseClass::NamedTuple(range, has_dynamic_fields)),
             bind_to_name,
+        );
+        class_indices.class_idx
+    }
+
+    /// Synthesize the anonymous manager class produced by
+    /// `SomeQuerySet.as_manager()` / `Manager.from_queryset(SomeQuerySet)`. It has no
+    /// declared members; its base (`Manager[Model]`) and grafted queryset methods are
+    /// computed at solve time from `qs_expr` (recorded in the synthesized base).
+    pub fn synthesize_django_manager_def(
+        &mut self,
+        parent: &NestingContext,
+        qs_expr: &mut Expr,
+    ) -> Idx<KeyClass> {
+        // Use the queryset expression's range for the class object's anon key so it
+        // doesn't collide with the call's anon key (which holds the `ClassDef` binding).
+        let class_name = Identifier::new(Name::new_static("Manager"), qs_expr.range());
+        let (mut class_object, class_indices) = self.anon_class_object_and_indices(&class_name);
+        // Attribute the queryset's usage to the synthesized class so it depends on it.
+        self.ensure_expr(qs_expr, class_object.usage());
+        let range = class_name.range();
+        self.synthesize_class_def(
+            class_name,
+            class_object,
+            class_indices.clone(),
+            parent,
+            None,
+            Box::new([]),
+            Vec::new(),
+            IllegalIdentifierHandling::Error,
+            false,
+            SynthesizedClassKind::DjangoManager,
+            Some(BaseClass::DjangoManagerFromQuerySet(
+                Box::new(qs_expr.clone()),
+                range,
+            )),
+            false,
         );
         class_indices.class_idx
     }

@@ -25,6 +25,7 @@ use ruff_python_ast::ExprStringLiteral;
 use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use starlark_map::small_map::SmallMap;
+use starlark_map::small_set::SmallSet;
 
 use crate::alt::answers::LookupAnswer;
 use crate::alt::answers_solver::AnswersSolver;
@@ -81,7 +82,6 @@ const CHAR_FIELD: Name = Name::new_static("CharField");
 const MANY_TO_MANY_FIELD: Name = Name::new_static("ManyToManyField");
 const MODEL: Name = Name::new_static("Model");
 const MANYRELATEDMANAGER: Name = Name::new_static("ManyRelatedManager");
-const AS_MANAGER: Name = Name::new_static("as_manager");
 const SYMMETRICAL: Name = Name::new_static("symmetrical");
 
 /// Find a keyword argument by name and return its value expression.
@@ -108,6 +108,7 @@ fn has_keyword_false(call_expr: &ExprCall, name: &Name) -> bool {
 const RELATED_NAME: Name = Name::new_static("related_name");
 
 const RELATED_MANAGER: Name = Name::new_static("RelatedManager");
+const MANAGER: Name = Name::new_static("Manager");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DjangoRelationKind {
@@ -236,7 +237,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             })
     }
 
-    fn inherits_from_django_queryset(&self, cls: &Class) -> bool {
+    pub(crate) fn inherits_from_django_queryset(&self, cls: &Class) -> bool {
         cls.has_toplevel_qname("django.db.models.query", "QuerySet")
             || self
                 .get_mro_for_class(cls)
@@ -244,36 +245,52 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 .any(|ancestor| ancestor.has_qname("django.db.models.query", "QuerySet"))
     }
 
-    /// If `call` is `SomeQuerySet.as_manager()` where `SomeQuerySet` subclasses
-    /// Django's `QuerySet`, return the queryset instance type.
-    ///
-    /// The stubs type `as_manager()` as `-> Manager[Model]`, which drops the
-    /// queryset's custom methods. Modeling the result as the queryset instead keeps
-    /// them visible (mypy's Django plugin does the equivalent by synthesizing a
-    /// manager that proxies the queryset). Resolving this at the call site — rather
-    /// than only at the `objects = ...` assignment — lets the result flow through a
-    /// name binding, including one imported from another module.
-    pub fn django_queryset_as_manager_return(&self, call: &ExprCall) -> Option<Type> {
-        let Expr::Attribute(attr) = call.func.as_ref() else {
-            return None;
-        };
-        if attr.attr.id != AS_MANAGER {
-            return None;
-        }
-        match self.expr_infer(&attr.value, &self.error_swallower()) {
-            Type::ClassDef(queryset_cls) if self.inherits_from_django_queryset(&queryset_cls) => {
-                Some(self.instantiate(&queryset_cls))
-            }
+    /// Resolve the queryset class referenced by a `DjangoManagerFromQuerySet` base —
+    /// the receiver of `SomeQuerySet.as_manager()` or the argument of `from_queryset`.
+    /// Returns `None` when the expression is not a Django queryset class.
+    pub(crate) fn resolve_django_manager_queryset(&self, qs_expr: &Expr) -> Option<Class> {
+        match self.expr_infer(qs_expr, &self.error_swallower()) {
+            Type::ClassDef(qs) if self.inherits_from_django_queryset(&qs) => Some(qs),
             _ => None,
         }
     }
 
+    /// The base type for a synthesized manager class: `Manager[Model]`, where `Model`
+    /// is the queryset's element type (`QuerySet[Model]`). Falls back to an
+    /// unparameterized `Manager` if the model can't be extracted, and `None` if the
+    /// expression isn't a queryset. A `Manager` base (not the queryset) is what keeps
+    /// `__iter__`/`__getitem__` off the manager.
+    pub(crate) fn django_manager_base_type(&self, qs_expr: &Expr) -> Option<Type> {
+        let qs = self.resolve_django_manager_queryset(qs_expr)?;
+        let manager_class_type = self.get_from_export(
+            ModuleName::django_models_manager(),
+            None,
+            &KeyExport(MANAGER),
+        );
+        let Type::ClassDef(manager_class) = manager_class_type.as_ref() else {
+            return None;
+        };
+        let model = self
+            .get_mro_for_class(&qs)
+            .ancestors(self.stdlib)
+            .find(|ancestor| ancestor.has_qname("django.db.models.query", "QuerySet"))
+            .and_then(|qs_ancestor| qs_ancestor.targs().as_slice().first().cloned());
+        match model {
+            Some(model) => Some(self.specialize(
+                manager_class,
+                vec![model],
+                TextRange::default(),
+                &self.error_swallower(),
+            )),
+            None => Some(self.instantiate(manager_class)),
+        }
+    }
+
     /// Type of a model's `objects` (or other manager) field when it is assigned a
-    /// `QuerySet.as_manager()` result, directly or through a name (possibly
-    /// imported). The value's type is the queryset instance (see
-    /// [`Self::django_queryset_as_manager_return`]); returning it here uses it as
-    /// the field type so the queryset's custom methods stay visible and it
-    /// overrides the inherited `objects: Manager[Self]` annotation.
+    /// synthesized manager (from `QuerySet.as_manager()`), directly or through a name
+    /// (possibly imported). Returning the synthesized manager type here uses it as the
+    /// field type — overriding the inherited `objects: Manager[Self]` annotation — so
+    /// the grafted queryset methods stay visible.
     pub fn get_django_manager_from_queryset_type(
         &self,
         model: &Class,
@@ -285,7 +302,10 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         let ty = self.expr_infer(initial_value_expr?, &self.error_swallower());
         match &ty {
             Type::ClassType(class_type)
-                if self.inherits_from_django_queryset(class_type.class_object()) =>
+                if self
+                    .get_metadata_for_class(class_type.class_object())
+                    .django_manager_from_queryset()
+                    .is_some() =>
             {
                 Some(ty)
             }
@@ -699,6 +719,62 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         }
 
         Some(ClassSynthesizedFields::new(fields))
+    }
+
+    /// Synthesized fields for a manager class created from a queryset (see
+    /// [`Self::django_manager_base_type`]). Mirrors Django's `Manager.from_queryset`:
+    /// the queryset's *public* methods (including inherited `QuerySet` ones like
+    /// `filter`/`all`, so chaining returns the queryset) are exposed on the manager,
+    /// resolved on a queryset instance so type args and `Self` are substituted correctly.
+    /// Private/dunder members are skipped — which excludes `__iter__`/`__getitem__`,
+    /// keeping the manager non-iterable. Methods are stored as classvars holding the
+    /// already-bound callable (the manager delegates to the queryset), so they are not
+    /// re-bound to the manager.
+    pub fn get_django_manager_from_queryset_synthesized_fields(
+        &self,
+        cls: &Class,
+    ) -> Option<ClassSynthesizedFields> {
+        let queryset = self
+            .get_metadata_for_class(cls)
+            .django_manager_from_queryset()?
+            .clone();
+        let qs_instance = self.instantiate(&queryset);
+
+        // Collect the queryset's public attribute names across its full MRO.
+        let mut names: Vec<Name> = Vec::new();
+        let mut seen: SmallSet<Name> = SmallSet::new();
+        let collect = |cls: &Class, names: &mut Vec<Name>, seen: &mut SmallSet<Name>| {
+            if let Some(class_fields) = self.get_class_fields(cls) {
+                for name in class_fields.class_body_fields() {
+                    if !name.as_str().starts_with('_') && seen.insert(name.clone()) {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        };
+        collect(&queryset, &mut names, &mut seen);
+        for ancestor in self.get_mro_for_class(&queryset).ancestors(self.stdlib) {
+            if ancestor.class_object().is_builtin("object") {
+                continue;
+            }
+            collect(ancestor.class_object(), &mut names, &mut seen);
+        }
+
+        let mut fields: SmallMap<Name, ClassSynthesizedField> = SmallMap::new();
+        for name in names {
+            // Resolve each method as it appears on a queryset instance, so inherited
+            // generic returns (e.g. `get -> Model`, `filter -> QuerySet`) and `Self` are
+            // substituted. Store as a classvar so it is not re-bound to the manager.
+            let ty = self.attr_infer_for_type(
+                &qs_instance,
+                &name,
+                TextRange::default(),
+                &self.error_swallower(),
+                None,
+            );
+            fields.insert(name, ClassSynthesizedField::new_classvar(ty));
+        }
+        (!fields.is_empty()).then(|| ClassSynthesizedFields::new(fields))
     }
 
     fn get_django_reverse_relationship_synthesized_fields(

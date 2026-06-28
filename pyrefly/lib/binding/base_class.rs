@@ -107,6 +107,10 @@ pub enum BaseClass {
     /// At runtime, evaluates to the metaclass of X (if X is a class)
     /// or the class of X (if X is an instance).
     TypeOf(BaseClassExpr, TextRange),
+    /// Synthesized base for a Django manager created from a queryset, i.e. the
+    /// class produced by `SomeQuerySet.as_manager()` / `Manager.from_queryset(SomeQuerySet)`.
+    /// The expression is the queryset value; at solve time it resolves to `Manager[Model]`.
+    DjangoManagerFromQuerySet(Box<Expr>, TextRange),
 }
 
 impl BaseClass {
@@ -135,6 +139,7 @@ impl Ranged for BaseClass {
             BaseClass::NamedTuple(range, _) => *range,
             BaseClass::SynthesizedBase(_, range) => *range,
             BaseClass::TypeOf(_, range) => *range,
+            BaseClass::DjangoManagerFromQuerySet(_, range) => *range,
         }
     }
 }

@@ -324,6 +324,15 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 base_class_object.is_builtin("type") || metadata.is_metaclass()
             });
 
+        // A class synthesized to model `SomeQuerySet.as_manager()` records the source
+        // queryset, whose own methods are grafted on as synthesized fields.
+        let django_manager_from_queryset = bases.iter().find_map(|b| match b {
+            BaseClass::DjangoManagerFromQuerySet(qs_expr, _) => {
+                self.resolve_django_manager_queryset(qs_expr)
+            }
+            _ => None,
+        });
+
         // Compute various pieces of special metadata.
         let has_base_any = contains_base_class_any
             || bases_with_metadata
@@ -556,6 +565,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             pydantic_model_kind,
             is_attrs_class,
             django_model_metadata,
+            django_manager_from_queryset,
             is_marshmallow_schema,
             is_factory_boy_factory,
             is_drf_serializer,
@@ -1662,6 +1672,14 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                             _ => BaseClassParseResult::InvalidType(ty, range),
                         }
                     }
+                }
+            }
+            BaseClass::DjangoManagerFromQuerySet(qs_expr, _) => {
+                match self.django_manager_base_type(qs_expr) {
+                    Some(ty) => parse_base_class_type(ty),
+                    // Receiver wasn't a queryset; the synthesized class is unused, so
+                    // give it no explicit base.
+                    None => BaseClassParseResult::Ignored,
                 }
             }
             BaseClass::TypedDict(..) | BaseClass::Generic(..) => {

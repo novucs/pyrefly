@@ -107,6 +107,10 @@ pub struct ClassMetadata {
     pydantic_model_kind: Option<PydanticModelKind>,
     is_attrs_class: bool,
     django_model_metadata: Option<DjangoModelMetadata>,
+    /// For a class synthesized to model `SomeQuerySet.as_manager()` /
+    /// `Manager.from_queryset(SomeQuerySet)`, the source queryset class. Its own
+    /// methods are grafted onto this manager as synthesized fields.
+    django_manager_from_queryset: Option<Class>,
     is_marshmallow_schema: bool,
     is_factory_boy_factory: bool,
     /// Whether this class is a Django REST Framework serializer (subclass of
@@ -177,6 +181,7 @@ impl ClassMetadata {
         pydantic_model_kind: Option<PydanticModelKind>,
         is_attrs_class: bool,
         django_model_metadata: Option<DjangoModelMetadata>,
+        django_manager_from_queryset: Option<Class>,
         is_marshmallow_schema: bool,
         is_factory_boy_factory: bool,
         is_drf_serializer: bool,
@@ -207,6 +212,7 @@ impl ClassMetadata {
             pydantic_model_kind,
             is_attrs_class,
             django_model_metadata,
+            django_manager_from_queryset,
             is_marshmallow_schema,
             is_factory_boy_factory,
             is_drf_serializer,
@@ -240,6 +246,7 @@ impl ClassMetadata {
             pydantic_model_kind: None,
             is_attrs_class: false,
             django_model_metadata: None,
+            django_manager_from_queryset: None,
             is_marshmallow_schema: false,
             is_factory_boy_factory: false,
             is_drf_serializer: false,
@@ -281,6 +288,11 @@ impl ClassMetadata {
 
     pub fn is_django_model(&self) -> bool {
         self.django_model_metadata.is_some()
+    }
+
+    /// For a synthesized Django manager class, the queryset it was created from.
+    pub fn django_manager_from_queryset(&self) -> Option<&Class> {
+        self.django_manager_from_queryset.as_ref()
     }
 
     pub fn is_marshmallow_schema(&self) -> bool {
