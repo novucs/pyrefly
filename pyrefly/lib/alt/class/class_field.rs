@@ -2467,6 +2467,28 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         } else {
             IsInherited::Maybe
         };
+        // A Django model field assigned in a subclass (e.g. `rel = ForeignKey(Sub)`)
+        // overrides an inherited declaration (`rel: Base`). Use the field's synthesized
+        // type — the related model for a ForeignKey — so the precise type is visible,
+        // rather than letting the annotation hide it or comparing the raw field object
+        // against it.
+        //
+        // We keep `IsInherited::Maybe` so the override check still runs: narrowing a
+        // *writable* base attribute is unsound (a base-typed reference could write a
+        // wider value), and that is correctly reported as a mutable-attribute override.
+        // The sound way to express this pattern is a read-only base declaration (e.g. a
+        // `@property` returning `Base`), against which the covariant override is allowed.
+        if direct_annotation.is_none()
+            && let Some(inherited_ty) = inherited_annotation.as_ref().and_then(|a| a.ty.as_ref())
+            && let ExprOrBinding::Expr(e) = value
+        {
+            let raw_ty = self.attribute_expr_infer(e, None, name, &self.error_swallower());
+            if let Some(field_ty) = self.get_django_field_type(&raw_ty, class, Some(name), Some(e))
+                && self.is_subset_eq(&field_ty, inherited_ty)
+            {
+                return (field_ty, None, IsInherited::Maybe);
+            }
+        }
         let final_annotation = Self::merge_direct_qualifiers_with_inherited_annotation(
             inherited_annotation.clone(),
             direct_qualifiers,
