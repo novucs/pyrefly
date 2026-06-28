@@ -231,3 +231,68 @@ def test_through_db_table_mutually_exclusive(self):
         referred = models.ForeignKey(Child, on_delete=models.CASCADE)
 "#,
 );
+
+// A ForeignKey in a concrete subclass overriding a field declared on an abstract
+// base. The field resolves to the precise concrete target (so subtype-only
+// attributes are visible), but when the base declares the relation as a *writable*
+// attribute, narrowing it is unsound (a base-typed reference could write a wider
+// value) and is correctly flagged as a mutable-attribute override.
+django_testcase!(
+    test_foreign_key_overrides_inherited_writable_annotation,
+    r#"
+from typing import assert_type
+from django.db import models
+
+class Shape(models.Model):
+    name = models.CharField(max_length=70)
+
+class Circle(Shape):
+    radius = models.IntegerField(default=0)
+
+class Container(models.Model):
+    item: Shape  # writable attribute declaration
+    class Meta:
+        abstract = True
+
+class CircleContainer(Container):
+    # Resolves to the precise target, but narrowing the writable base attribute is
+    # unsound, so it is reported.
+    item = models.ForeignKey(Circle, on_delete=models.CASCADE)  # E: overrides parent class `Container` in an inconsistent manner
+
+c = CircleContainer()
+assert_type(c.item, Circle)
+assert_type(c.item.radius, int)
+"#,
+);
+
+// The sound way to express the pattern: the base declares the relation read-only
+// (a property), so the concrete subclass's covariant FK override is sound — precise
+// reads, and writing through a base-typed reference is rejected.
+django_testcase!(
+    test_foreign_key_overrides_readonly_base_relation,
+    r#"
+from typing import assert_type
+from django.db import models
+
+class Shape(models.Model):
+    name = models.CharField(max_length=70)
+
+class Circle(Shape):
+    radius = models.IntegerField(default=0)
+
+class Container(models.Model):
+    @property
+    def item(self) -> Shape: ...  # read-only relation declaration
+    class Meta:
+        abstract = True
+
+class CircleContainer(Container):
+    item = models.ForeignKey(Circle, on_delete=models.CASCADE)
+
+assert_type(CircleContainer().item, Circle)
+assert_type(CircleContainer().item.radius, int)
+
+def f(c: Container, s: Shape) -> None:
+    c.item = s  # E: read-only property and cannot be set
+"#,
+);
