@@ -299,6 +299,10 @@ impl ModuleName {
         Self::from_str("factory.base")
     }
 
+    pub fn factory_helpers() -> Self {
+        Self::from_str("factory.helpers")
+    }
+
     pub fn marshmallow_schema() -> Self {
         Self::from_str("marshmallow.schema")
     }

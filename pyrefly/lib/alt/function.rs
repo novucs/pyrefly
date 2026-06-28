@@ -14,6 +14,7 @@ use dupe::Dupe;
 use pyrefly_graph::index::Idx;
 use pyrefly_python::ast::Ast;
 use pyrefly_python::dunder;
+use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModuleStyle;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_types::callable::FuncId;
@@ -118,6 +119,19 @@ fn is_class_property_decorator_type(ty: &Type) -> bool {
         Type::ClassType(cls) => is_class_property_decorator_class_object(cls.class_object()),
         _ => false,
     }
+}
+
+/// Whether `ty` is factory_boy's `@post_generation` decorator. A method it
+/// decorates receives the generated model instance as `self` (not the factory),
+/// so an explicit `self: Model` annotation is correct and must be exempt from the
+/// self-annotation superclass check.
+fn is_factory_post_generation_decorator(ty: &Type) -> bool {
+    matches!(
+        ty.callee_kind(),
+        Some(CalleeKind::Function(FunctionKind::Def(func_id)))
+            if func_id.name.as_str() == "post_generation"
+                && func_id.module.name() == ModuleName::factory_helpers()
+    )
 }
 
 struct PreparedDecoratorApplication {
@@ -823,7 +837,12 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         def.id_range(),
                         errors,
                     );
-                } else if !def.metadata.flags.is_staticmethod {
+                } else if !def.metadata.flags.is_staticmethod
+                    && !def
+                        .decorators
+                        .iter()
+                        .any(|(d, _)| is_factory_post_generation_decorator(d))
+                {
                     self.validate_self_annotation(
                         cls,
                         &stmt.name.id,
@@ -2584,13 +2603,6 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         range: TextRange,
         errors: &ErrorCollector,
     ) {
-        // factory_boy declaration methods (e.g. `@post_generation`) receive the
-        // generated model instance as `self`, not the factory, so an explicit
-        // `self: Model` annotation is correct and must not be validated against the
-        // factory class.
-        if self.get_metadata_for_class(cls).is_factory_boy_factory() {
-            return;
-        }
         if let Params::List(param_list) = &callable.params
             && let Some(Param::PosOnly(_, self_ty, _) | Param::Pos(_, self_ty, _)) =
                 param_list.items().first()

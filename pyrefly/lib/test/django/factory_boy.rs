@@ -178,3 +178,18 @@ class UserFactory(DjangoModelFactory):
         self.set_password(extracted or "x")
 "#,
 );
+
+// The exemption is specific to `@post_generation`: a regular method on a factory
+// with a bogus `self:` annotation is still validated.
+factory_boy_testcase!(
+    test_factory_non_post_generation_self_still_checked,
+    r#"
+from factory.django import DjangoModelFactory
+
+class Other: ...
+
+class ExampleFactory(DjangoModelFactory):
+    def helper(self: Other) -> None:  # E: is not a superclass of class `ExampleFactory`
+        pass
+"#,
+);
