@@ -1858,7 +1858,16 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         let call_target =
             self.as_call_target_or_error(decorator, CallStyle::FreeForm, range, errors, None);
         let arg = CallArg::ty(&decoratee, range);
-        self.call_infer(call_target, &[arg], &[], range, errors, None, None, None)
+        let decorated = self.call_infer(call_target, &[arg], &[], range, errors, None, None, None);
+        // A decorator returning an unknown type or a plain callable (rather than a class) shouldn't
+        // erase the class identity; preserve the decoratee so member access still resolves.
+        if decorated.is_toplevel_callable()
+            || self.untype_opt(decorated.clone(), range, errors).is_some()
+        {
+            decoratee
+        } else {
+            decorated
+        }
     }
 
     /// For a type guard function, validate whether it has at least one
