@@ -2991,17 +2991,17 @@ impl<'a> LookupExport for TransactionHandle<'a> {
 }
 
 impl<'a> LookupAnswer for TransactionHandle<'a> {
-    fn modules(&self) -> SmallSet<ModuleName> {
+    fn modules(&self) -> Vec<Handle> {
         let mut res = self
             .transaction
             .data
             .updated_modules
             .iter_unordered()
-            .map(|x| x.0.module())
-            .collect::<SmallSet<_>>();
+            .map(|x| x.0.dupe())
+            .collect::<Vec<_>>();
         for handle in self.transaction.readable.modules.keys() {
             if self.transaction.data.updated_modules.get(handle).is_none() {
-                res.insert(handle.module());
+                res.push(handle.dupe());
             }
         }
         res

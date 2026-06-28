@@ -1934,11 +1934,17 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         }
 
         let mut combined: SmallMap<Class, ClassSynthesizedFields> = SmallMap::new();
-        for module in self.answers.modules() {
-            let Some(index) =
-                self.answers
-                    .get(module, None, &KeyDjangoRelations, self.thread_state)
-            else {
+        for handle in self.answers.modules() {
+            // Look up by the module's known path rather than re-resolving by name:
+            // a loaded module's name may not resolve via import (e.g. the synthetic
+            // `__unknown__` module, or a local file shadowing a package), which
+            // would otherwise panic.
+            let Some(index) = self.answers.get(
+                handle.module(),
+                Some(handle.path()),
+                &KeyDjangoRelations,
+                self.thread_state,
+            ) else {
                 continue;
             };
             for (class, fields) in index.iter() {
