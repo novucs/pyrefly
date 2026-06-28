@@ -1,0 +1,3 @@
+from typing import Any, Callable
+
+def post_generation(fun: Callable[..., Any]) -> Any: ...

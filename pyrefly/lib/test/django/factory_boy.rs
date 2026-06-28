@@ -154,3 +154,27 @@ class IncompleteFactory(DjangoModelFactory):
 obj = IncompleteFactory.create()
 "#,
 );
+
+// `@post_generation` hooks receive the generated model instance as `self`, not the
+// factory, so an explicit `self: Model` annotation is correct and must not be
+// validated against the factory class.
+factory_boy_testcase!(
+    test_post_generation_self_is_model,
+    r#"
+from django.db import models
+from factory import post_generation
+from factory.django import DjangoModelFactory
+
+class User(models.Model):
+    username = models.CharField(max_length=150)
+    def set_password(self, raw: str) -> None: ...
+
+class UserFactory(DjangoModelFactory):
+    class Meta:
+        model = User
+
+    @post_generation
+    def password(self: User, create: bool, extracted: str | None, **kwargs) -> None:
+        self.set_password(extracted or "x")
+"#,
+);
