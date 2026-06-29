@@ -279,6 +279,10 @@ impl ModuleName {
         Self::from_str("django.db.models.base")
     }
 
+    pub fn django_models_manager() -> Self {
+        Self::from_str("django.db.models.manager")
+    }
+
     pub fn django_models_fields() -> Self {
         Self::from_str("django.db.models.fields")
     }
@@ -299,8 +303,16 @@ impl ModuleName {
         Self::from_str("factory.base")
     }
 
+    pub fn factory_helpers() -> Self {
+        Self::from_str("factory.helpers")
+    }
+
     pub fn marshmallow_schema() -> Self {
         Self::from_str("marshmallow.schema")
+    }
+
+    pub fn rest_framework_serializers() -> Self {
+        Self::from_str("rest_framework.serializers")
     }
 
     pub fn pydantic_types() -> Self {

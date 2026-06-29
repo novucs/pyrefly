@@ -28,6 +28,7 @@ use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::prelude::SliceExt;
 use pyrefly_util::prelude::VecExt;
 use ruff_python_ast::Expr;
+use ruff_python_ast::Identifier;
 use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
@@ -38,8 +39,11 @@ use starlark_map::small_set::SmallSet;
 
 use crate::alt::answers::LookupAnswer;
 use crate::alt::answers_solver::AnswersSolver;
+use crate::alt::call::CallStyle;
+use crate::alt::callable::CallKeyword;
 use crate::alt::class::attrs::is_attrs_setters_frozen;
 use crate::alt::class::django::is_django_choices_subclass;
+use crate::alt::expr::TypeOrExpr;
 use crate::alt::solve::TypeFormContext;
 use crate::alt::types::abstract_class::AbstractClassMembers;
 use crate::alt::types::class_metadata::ClassDisjointBase;
@@ -72,6 +76,7 @@ use crate::binding::binding::KeyAnnotation;
 use crate::binding::binding::KeyClassField;
 use crate::binding::binding::KeyDecorator;
 use crate::binding::django::DjangoFieldInfo;
+use crate::binding::pydantic::EXTRA;
 use crate::binding::pydantic::PydanticConfigDict;
 use crate::binding::pydantic::VALIDATION_ALIAS;
 use crate::config::error_kind::ErrorKind;
@@ -142,7 +147,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         &self,
         cls: &Class,
         bases: &[BaseClass],
-        keywords: &[(Name, Expr)],
+        keywords: &[(Identifier, Expr)],
         decorators: &[Idx<KeyDecorator>],
         is_new_type: bool,
         pydantic_config_dict: &PydanticConfigDict,
@@ -183,11 +188,12 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         let bases_with_metadata = self.bases_with_metadata(parsed_results, is_new_type, errors);
 
         // Compute class keywords, including the metaclass.
-        let (metaclasses, keywords): (Vec<_>, Vec<(_, _)>) =
-            keywords.iter().partition_map(|(n, x)| match n.as_str() {
+        let (metaclasses, keyword_annotations): (Vec<_>, Vec<(_, _)>) =
+            keywords.iter().partition_map(|(n, x)| match n.id.as_str() {
                 "metaclass" => Either::Left(x),
                 _ => Either::Right((n.clone(), self.expr_class_keyword(x, errors))),
             });
+        let keyword_annotations = keyword_annotations.into_map(|(name, annot)| (name.id, annot));
 
         let base_metaclasses = bases_with_metadata
             .iter()
@@ -248,6 +254,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             }
         }
         let metaclass = calculated_metaclass.get();
+        self.check_init_subclass_keywords(cls, &bases_with_metadata, metaclass, keywords, errors);
 
         let mut directly_inherits_model = false;
         let mut inherited_django_metadata: Option<&DjangoModelMetadata> = None;
@@ -302,11 +309,29 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         || metadata.is_factory_boy_factory()
                 });
 
+        let is_drf_serializer = bases_with_metadata
+            .iter()
+            .any(|(base_class_object, metadata)| {
+                base_class_object.has_toplevel_qname(
+                    ModuleName::rest_framework_serializers().as_str(),
+                    "BaseSerializer",
+                ) || metadata.is_drf_serializer()
+            });
+
         let is_metaclass = bases_with_metadata
             .iter()
             .any(|(base_class_object, metadata)| {
                 base_class_object.is_builtin("type") || metadata.is_metaclass()
             });
+
+        // A class synthesized to model `SomeQuerySet.as_manager()` records the source
+        // queryset, whose own methods are grafted on as synthesized fields.
+        let django_manager_from_queryset = bases.iter().find_map(|b| match b {
+            BaseClass::DjangoManagerFromQuerySet(qs_expr, _) => {
+                self.resolve_django_manager_queryset(qs_expr)
+            }
+            _ => None,
+        });
 
         // Compute various pieces of special metadata.
         let has_base_any = contains_base_class_any
@@ -339,7 +364,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         let pydantic_config = self.pydantic_config(
             &bases_with_metadata,
             pydantic_config_dict,
-            &keywords,
+            &keyword_annotations,
             &decorators,
             errors,
             cls.range(),
@@ -358,8 +383,13 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 format!("`{}` is not a typed dictionary. Typed dictionary definitions may only extend other typed dictionaries.", bad.0.name()),
             );
         }
-        let typed_dict_metadata =
-            self.typed_dict_metadata(cls, &bases_with_metadata, &keywords, is_typed_dict, errors);
+        let typed_dict_metadata = self.typed_dict_metadata(
+            cls,
+            &bases_with_metadata,
+            &keyword_annotations,
+            is_typed_dict,
+            errors,
+        );
         if metaclass.is_some() && is_typed_dict {
             self.error(
                 errors,
@@ -435,14 +465,14 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 })
             });
         let dataclass_transform_metadata = self.dataclass_transform_metadata(
-            &keywords,
+            &keyword_annotations,
             &decorators,
             metaclass,
             dataclass_defaults_from_base_class.clone(),
         );
         let dataclass_from_dataclass_transform = self.dataclass_from_dataclass_transform(
             cls,
-            &keywords,
+            &keyword_annotations,
             &decorators,
             dataclass_defaults_from_base_class,
             pydantic_config.as_ref(),
@@ -499,7 +529,7 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         };
 
         // Get types of class keywords.
-        let keywords = keywords.into_map(|(name, annot)| {
+        let keywords = keyword_annotations.into_map(|(name, annot)| {
             (
                 name,
                 annot.ty.unwrap_or_else(|| self.heap.mk_any_implicit()),
@@ -535,8 +565,10 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             pydantic_model_kind,
             is_attrs_class,
             django_model_metadata,
+            django_manager_from_queryset,
             is_marshmallow_schema,
             is_factory_boy_factory,
+            is_drf_serializer,
             is_metaclass,
             explicit_slots,
             capture_init.map(|names| names.to_vec()),
@@ -590,6 +622,61 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 None
             }
         }
+    }
+
+    fn check_init_subclass_keywords(
+        &self,
+        cls: &Class,
+        bases_with_metadata: &[(Class, Arc<ClassMetadata>)],
+        metaclass: Option<&ClassType>,
+        keywords: &[(Identifier, Expr)],
+        errors: &ErrorCollector,
+    ) {
+        let is_pydantic_model = bases_with_metadata.iter().any(|(base, metadata)| {
+            base.has_toplevel_qname(ModuleName::pydantic().as_str(), "BaseModel")
+                || metadata.is_pydantic_model()
+        });
+        let keywords = keywords
+            .iter()
+            .filter(|(name, _)| name.id != "metaclass" && !(is_pydantic_model && name.id == EXTRA))
+            .collect::<Vec<_>>();
+        if !keywords.is_empty() && metaclass.is_some() {
+            return;
+        }
+        let Some((base, _)) = bases_with_metadata.first() else {
+            return;
+        };
+        let include_init_subclass_ancestors = !keywords.is_empty();
+        let base = self.promote_nontypeddict_silently_to_classtype(base);
+        let Some(init_subclass) =
+            self.get_dunder_init_subclass(&base, include_init_subclass_ancestors)
+        else {
+            return;
+        };
+        let keywords = keywords
+            .into_iter()
+            .map(|(name, value)| CallKeyword {
+                range: name.range(),
+                arg: Some(name),
+                value: TypeOrExpr::Expr(value),
+            })
+            .collect::<Vec<_>>();
+        self.call_infer(
+            self.as_call_target_or_error(
+                init_subclass,
+                CallStyle::Method(&dunder::INIT_SUBCLASS),
+                cls.range(),
+                errors,
+                None,
+            ),
+            &[],
+            &keywords,
+            cls.range(),
+            errors,
+            None,
+            None,
+            None,
+        );
     }
 
     fn explicit_slots(&self, cls: &Class) -> ExplicitSlots {
@@ -1585,6 +1672,14 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                             _ => BaseClassParseResult::InvalidType(ty, range),
                         }
                     }
+                }
+            }
+            BaseClass::DjangoManagerFromQuerySet(qs_expr, _) => {
+                match self.django_manager_base_type(qs_expr) {
+                    Some(ty) => parse_base_class_type(ty),
+                    // Receiver wasn't a queryset; the synthesized class is unused, so
+                    // give it no explicit base.
+                    None => BaseClassParseResult::Ignored,
                 }
             }
             BaseClass::TypedDict(..) | BaseClass::Generic(..) => {

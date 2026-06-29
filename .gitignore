@@ -1,3 +1,7 @@
 debug.json
 debug.js
 target/
+
+# Local-only notes and scratch (never commit — may reference private codebases)
+.private/
+.idea/

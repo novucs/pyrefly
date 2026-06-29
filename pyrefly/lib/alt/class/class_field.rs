@@ -2175,6 +2175,17 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         range: TextRange,
         errors: &ErrorCollector,
     ) -> Option<Type> {
+        let initial_value_expr = match field_definition {
+            ClassFieldDefinition::AssignedInBody { value, .. } => {
+                if let ExprOrBinding::Expr(expr) = value.as_ref() {
+                    Some(expr)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
         self.get_enum_class_field_type(
             class,
             name,
@@ -2188,18 +2199,12 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         .or_else(|| self.get_property_class_field_type(class, name, field_definition))
         .or_else(|| self.get_pydantic_root_model_class_field_type(class, name))
         .or_else(|| {
-            let initial_value_expr = match field_definition {
-                ClassFieldDefinition::AssignedInBody { value, .. } => {
-                    if let ExprOrBinding::Expr(expr) = value.as_ref() {
-                        Some(expr)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            self.get_django_field_type(ty, class, Some(name), initial_value_expr)
+            direct_annotation
+                .is_none()
+                .then(|| self.get_django_manager_from_queryset_type(class, initial_value_expr))
+                .flatten()
         })
+        .or_else(|| self.get_django_field_type(ty, class, Some(name), initial_value_expr))
     }
 
     /// Recognize `x = property(fget, fset, fdel)` and return the corresponding
@@ -2462,6 +2467,28 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         } else {
             IsInherited::Maybe
         };
+        // A Django model field assigned in a subclass (e.g. `rel = ForeignKey(Sub)`)
+        // overrides an inherited declaration (`rel: Base`). Use the field's synthesized
+        // type — the related model for a ForeignKey — so the precise type is visible,
+        // rather than letting the annotation hide it or comparing the raw field object
+        // against it.
+        //
+        // We keep `IsInherited::Maybe` so the override check still runs: narrowing a
+        // *writable* base attribute is unsound (a base-typed reference could write a
+        // wider value), and that is correctly reported as a mutable-attribute override.
+        // The sound way to express this pattern is a read-only base declaration (e.g. a
+        // `@property` returning `Base`), against which the covariant override is allowed.
+        if direct_annotation.is_none()
+            && let Some(inherited_ty) = inherited_annotation.as_ref().and_then(|a| a.ty.as_ref())
+            && let ExprOrBinding::Expr(e) = value
+        {
+            let raw_ty = self.attribute_expr_infer(e, None, name, &self.error_swallower());
+            if let Some(field_ty) = self.get_django_field_type(&raw_ty, class, Some(name), Some(e))
+                && self.is_subset_eq(&field_ty, inherited_ty)
+            {
+                return (field_ty, None, IsInherited::Maybe);
+            }
+        }
         let final_annotation = Self::merge_direct_qualifiers_with_inherited_annotation(
             inherited_annotation.clone(),
             direct_qualifiers,
@@ -2469,6 +2496,14 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         let inferred_ty = match value {
             ExprOrBinding::Expr(e) => {
                 match inherited_ty {
+                    Some(_)
+                        if direct_annotation.is_none()
+                            && self
+                                .get_django_manager_from_queryset_type(class, Some(e))
+                                .is_some() =>
+                    {
+                        self.attribute_expr_infer(e, None, name, errors)
+                    }
                     Some(inherited_ty) if inferred_from_method => {
                         // Inherit the previous type of the attribute if the only declaration-like
                         // thing the current class does is assign to the attribute in a method.
@@ -3305,15 +3340,22 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             return false;
         }
 
-        // Django models, marshmallow schemas, and factory-boy factories: skip override
-        // check for `Meta` class. These frameworks use a nested `Meta` class for
-        // configuration, and child classes define their own `Meta` without inheriting
-        // from the parent's `Meta`.
+        // Django models, marshmallow schemas, factory-boy factories, and DRF
+        // serializers: skip override check for `Meta` class. These frameworks use a
+        // nested `Meta` class for configuration, and child classes define their own
+        // `Meta` without inheriting from the parent's `Meta`.
         if (class_metadata.is_django_model()
             || class_metadata.is_marshmallow_schema()
-            || class_metadata.is_factory_boy_factory())
+            || class_metadata.is_factory_boy_factory()
+            || class_metadata.is_drf_serializer())
             && field_name.as_str() == "Meta"
         {
+            return false;
+        }
+
+        // Django models commonly replace `Model.objects` with a model-specific
+        // manager, which should not be checked as a normal class override.
+        if class_metadata.is_django_model() && field_name.as_str() == "objects" {
             return false;
         }
 
@@ -4387,6 +4429,45 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         self.get_dunder_init_helper(&Instance::of_class(cls), get_object_init)
     }
 
+    /// Get the class's `__init_subclass__` method, excluding `object.__init_subclass__`.
+    pub fn get_dunder_init_subclass(
+        &self,
+        cls: &ClassType,
+        include_ancestors: bool,
+    ) -> Option<Type> {
+        if cls.class_object().is_builtin("object") {
+            return None;
+        }
+        let init_subclass_member = if let Some(field) = self
+            .get_non_synthesized_field_from_current_class_only(
+                cls.class_object(),
+                &dunder::INIT_SUBCLASS,
+            ) {
+            WithDefiningClass {
+                value: field,
+                defining_class: cls.class_object().dupe(),
+            }
+        } else if !include_ancestors {
+            return None;
+        } else {
+            let mro = self.get_mro_for_class(cls.class_object());
+            self.get_field_from_ancestors(
+                cls.class_object(),
+                mro.ancestors_no_object().iter(),
+                &dunder::INIT_SUBCLASS,
+                &|cls, name| self.get_non_synthesized_field_from_current_class_only(cls, name),
+            )?
+        };
+        if init_subclass_member.value.is_init_var() {
+            return None;
+        }
+        Arc::unwrap_or_clone(init_subclass_member.value)
+            .as_raw_special_method_type(self.heap, &Instance::of_class(cls))
+            .and_then(|ty| {
+                make_bound_classmethod(self.heap, &ClassBase::ClassType(cls.clone()), ty).ok()
+            })
+    }
+
     pub fn get_typed_dict_dunder_init(&self, td: &TypedDictInner) -> Type {
         // We synthesize `__init__`, so the lookup will never entirely fail.
         //
@@ -4768,9 +4849,49 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 got_is_classvar,
             }));
         }
+        let cached_property_value_type = |getter: &Type| {
+            let ty = getter
+                .callable_return_type(self.heap)
+                .expect("cached_property getter should have a callable return type");
+            if getter.visit_toplevel_func_metadata(&|meta| meta.flags.is_return_inferred) {
+                ty.promote_implicit_literals(self.stdlib)
+            } else {
+                ty
+            }
+        };
         match (got, want) {
             (_, ClassAttribute::NoAccess(_)) | (ClassAttribute::NoAccess(_), _) => {
                 unreachable!("handled above")
+            }
+            (ClassAttribute::Property(got_getter, None, _), ClassAttribute::ReadWrite(want))
+                if got_getter.is_cached_property() =>
+            {
+                let got = cached_property_value_type(got_getter);
+                let subset_error = is_subset(&got, want)
+                    .map_or_else(Some, |_| is_subset(want, &got).map_or_else(Some, |_| None));
+                if let Some(subset_error) = subset_error {
+                    Err(Box::new(AttrSubsetError::Invariant {
+                        got,
+                        want: want.clone(),
+                        subset_error,
+                    }))
+                } else {
+                    Ok(())
+                }
+            }
+            (ClassAttribute::Property(got_getter, None, _), ClassAttribute::ReadOnly(want, _))
+                if got_getter.is_cached_property() =>
+            {
+                let got = cached_property_value_type(got_getter);
+                is_subset(&got, want).map_err(|subset_error| {
+                    Box::new(AttrSubsetError::Covariant {
+                        got,
+                        want: want.clone(),
+                        got_is_property: true,
+                        want_is_property: false,
+                        subset_error,
+                    })
+                })
             }
             (
                 ClassAttribute::Property(_, _, _),

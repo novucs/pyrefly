@@ -2824,6 +2824,11 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 if let Some(new_fields) = self.get_django_model_synthesized_fields(cls) {
                     fields = fields.combine(new_fields);
                 }
+                if let Some(new_fields) =
+                    self.get_django_manager_from_queryset_synthesized_fields(cls)
+                {
+                    fields = fields.combine(new_fields);
+                }
                 if let Some(new_fields) = self.get_factory_boy_synthesized_fields(cls) {
                     fields = fields.combine(new_fields);
                 }
@@ -5390,16 +5395,19 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 self.solve_function_binding(def, &mut pred, class_meta.as_ref(), errors)
             }
             Binding::Import(x) => self.solve_import(x, errors),
-            Binding::ClassDef(x, _decorators) => match &self.get_idx(*x).0 {
+            Binding::ClassDef(x, decorators) => match &self.get_idx(*x).0 {
                 None => self.heap.mk_any_implicit(),
                 Some(cls) => {
-                    // TODO: analyze the class decorators. At the moment, we don't actually support any type-level
-                    // analysis of class decorators (the decorators we do support like dataclass-related ones are
-                    // handled via custom bindings).
-                    //
-                    // Note that all decorators have their own binding so they are still type checked for errors
-                    // *inside* the decorator, we just don't analyze the application.
-                    self.heap.mk_class_def(cls.dupe())
+                    let mut ty = self.heap.mk_class_def(cls.dupe());
+                    for decorator_key in decorators.iter().rev() {
+                        if self.bindings().get(*decorator_key).is_class_metadata {
+                            continue;
+                        }
+                        let decorator = self.get_idx(*decorator_key);
+                        let range = self.bindings().idx_to_key(*decorator_key).range();
+                        ty = self.apply_class_decorator(decorator.ty.clone(), ty, range, errors);
+                    }
+                    ty
                 }
             },
             Binding::AnnotatedType(ann, val) => {
@@ -5870,11 +5878,14 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     unreachable!("guarded by matches! above")
                 };
                 let mut aliased_type = self.untype_opt(ta.as_type(), range, errors)?;
-                if let Type::Union(f) = &mut aliased_type {
+                if let Type::Union(f) = &mut aliased_type
+                    && f.display_name.is_none()
+                {
                     f.display_name = Some((self.module().name(), (*ta.name).clone()));
                 }
                 Some(aliased_type)
             }
+            Type::KwCall(call) => self.untype_opt(call.return_ty, range, errors),
             // `as_type_alias` untypes a type alias in order to validate that it is a legal type.
             // If we hit a recursive reference to the alias while untyping it, delay the untyping
             // to avoid a cycle.
@@ -6282,6 +6293,50 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     })
                     .collect();
                 Type::ParamSpecValue(ParamList::new(elts))
+            }
+            Expr::Name(name) if !Ast::is_synthesized_empty_name(name) => {
+                let key = Key::BoundName(ShortIdentifier::expr_name(name));
+                let inferred_ty = if let Some(idx) =
+                    self.bindings().key_to_idx_hashed_opt(Hashed::new(&key))
+                {
+                    let mut binding = self.bindings().get(idx);
+                    while let Binding::Forward(next) | Binding::ForwardToFirstUse(next) = binding {
+                        binding = self.bindings().get(*next);
+                    }
+                    if let Binding::ClassDef(class_idx, _) = binding
+                        && let Some(cls) = &self.get_idx(*class_idx).0
+                    {
+                        self.heap.mk_class_def(cls.dupe())
+                    } else if let Binding::PossibleLegacyTParam(key, _) = binding
+                        && let LegacyTypeParameterLookup::NotParameter(ty) = &*self.get_idx(*key)
+                        && matches!(ty, Type::KwCall(_))
+                    {
+                        ty.clone()
+                    } else {
+                        self.expr_infer(x, errors)
+                    }
+                } else {
+                    self.expr_infer(x, errors)
+                };
+                if type_form_context == TypeFormContext::BaseClassList
+                    && let Type::TypeAlias(ta) = &inferred_ty
+                    && let ta = self.get_type_alias(ta)
+                    && ta.style == TypeAliasStyle::Scoped
+                {
+                    return self.error(
+                        errors,
+                        x.range(),
+                        ErrorKind::InvalidInheritance,
+                        format!(
+                            "Cannot use scoped type alias `{}` as a base class. Use a legacy type alias instead: `{}: TypeAlias = {}`",
+                            ta.name,
+                            ta.name,
+                            self.for_display(ta.as_type())
+                        ),
+                    );
+                } else {
+                    self.untype(inferred_ty, x.range(), errors)
+                }
             }
             _ => {
                 let inferred_ty = self.expr_infer(x, errors);

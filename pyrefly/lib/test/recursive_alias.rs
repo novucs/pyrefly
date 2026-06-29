@@ -200,8 +200,8 @@ x3: X[str, int] = {0: 1}  # E: `dict[int, int]` is not assignable to `dict[str, 
 
 x4: X = [{'ok': 1}]
 x5: X[int, int] = [{'ok': 1}]
-x6: X = [{0: 1}]  # E: not assignable
-x7: X[int, int] = [{'no': 3.14}]  # E: not assignable
+x6: X = [{0: 1}]  # E: not assignable  # E: `int` is not assignable to `str`
+x7: X[int, int] = [{'no': 3.14}]  # E: not assignable  # E: `float` is not assignable to `int`
 
 def f[K, V](x1: X[K, V], x2: X[int, int]):
     reveal_type(x1)  # E: dict[K, V] | list[X[str, V]]

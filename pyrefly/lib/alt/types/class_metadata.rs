@@ -107,8 +107,15 @@ pub struct ClassMetadata {
     pydantic_model_kind: Option<PydanticModelKind>,
     is_attrs_class: bool,
     django_model_metadata: Option<DjangoModelMetadata>,
+    /// For a class synthesized to model `SomeQuerySet.as_manager()` /
+    /// `Manager.from_queryset(SomeQuerySet)`, the source queryset class. Its own
+    /// methods are grafted onto this manager as synthesized fields.
+    django_manager_from_queryset: Option<Class>,
     is_marshmallow_schema: bool,
     is_factory_boy_factory: bool,
+    /// Whether this class is a Django REST Framework serializer (subclass of
+    /// `rest_framework.serializers.BaseSerializer`).
+    is_drf_serializer: bool,
     /// Whether this class is a metaclass (i.e., a subclass of `type`).
     is_metaclass: bool,
     explicit_slots: ExplicitSlots,
@@ -174,8 +181,10 @@ impl ClassMetadata {
         pydantic_model_kind: Option<PydanticModelKind>,
         is_attrs_class: bool,
         django_model_metadata: Option<DjangoModelMetadata>,
+        django_manager_from_queryset: Option<Class>,
         is_marshmallow_schema: bool,
         is_factory_boy_factory: bool,
+        is_drf_serializer: bool,
         is_metaclass: bool,
         explicit_slots: ExplicitSlots,
         capture_init: Option<Vec<Name>>,
@@ -203,8 +212,10 @@ impl ClassMetadata {
             pydantic_model_kind,
             is_attrs_class,
             django_model_metadata,
+            django_manager_from_queryset,
             is_marshmallow_schema,
             is_factory_boy_factory,
+            is_drf_serializer,
             is_metaclass,
             explicit_slots,
             capture_init,
@@ -235,8 +246,10 @@ impl ClassMetadata {
             pydantic_model_kind: None,
             is_attrs_class: false,
             django_model_metadata: None,
+            django_manager_from_queryset: None,
             is_marshmallow_schema: false,
             is_factory_boy_factory: false,
+            is_drf_serializer: false,
             is_metaclass: false,
             explicit_slots: ExplicitSlots::Absent,
             capture_init: None,
@@ -277,12 +290,21 @@ impl ClassMetadata {
         self.django_model_metadata.is_some()
     }
 
+    /// For a synthesized Django manager class, the queryset it was created from.
+    pub fn django_manager_from_queryset(&self) -> Option<&Class> {
+        self.django_manager_from_queryset.as_ref()
+    }
+
     pub fn is_marshmallow_schema(&self) -> bool {
         self.is_marshmallow_schema
     }
 
     pub fn is_factory_boy_factory(&self) -> bool {
         self.is_factory_boy_factory
+    }
+
+    pub fn is_drf_serializer(&self) -> bool {
+        self.is_drf_serializer
     }
 
     /// Whether this class is a metaclass (i.e., a subclass of `type`).
@@ -670,6 +692,37 @@ pub struct DjangoModelMetadata {
     pub foreign_key_like_fields: Vec<Name>,
     /// Names of fields with choices=...
     pub fields_with_choices: Vec<Name>,
+}
+
+#[derive(Clone, Debug, TypeEq, PartialEq, Eq, Default)]
+pub struct DjangoReverseRelationIndex(SmallMap<Class, ClassSynthesizedFields>);
+
+impl DjangoReverseRelationIndex {
+    pub fn new(map: SmallMap<Class, ClassSynthesizedFields>) -> Self {
+        Self(map)
+    }
+
+    pub fn get(&self, cls: &Class) -> Option<&ClassSynthesizedFields> {
+        self.0.get(cls)
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&Class, &ClassSynthesizedFields)> {
+        self.0.iter()
+    }
+}
+
+impl Display for DjangoReverseRelationIndex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "DjangoReverseRelationIndex(len={})", self.0.len())
+    }
+}
+
+impl VisitMut<Type> for DjangoReverseRelationIndex {
+    fn recurse_mut(&mut self, f: &mut dyn FnMut(&mut Type)) {
+        for (_, fields) in self.0.iter_mut() {
+            fields.recurse_mut(f);
+        }
+    }
 }
 
 #[derive(Clone, Debug, TypeEq, PartialEq, Eq)]

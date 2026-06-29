@@ -294,6 +294,9 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         _ => None,
                     }
                 }
+                BaseClass::DjangoManagerFromQuerySet(qs_expr, _) => self
+                    .django_manager_base_type(qs_expr)
+                    .map(|ty| (ty, x.range())),
                 BaseClass::InvalidExpr(..) | BaseClass::TypedDict(..) | BaseClass::Generic(..) => {
                     None
                 }

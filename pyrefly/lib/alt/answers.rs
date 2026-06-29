@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dupe::Dupe;
+use pyrefly_build::handle::Handle;
 use pyrefly_graph::calculation::Calculation;
 use pyrefly_graph::index::Idx;
 use pyrefly_graph::index_map::IndexMap;
@@ -565,6 +566,13 @@ impl Solutions {
 }
 
 pub trait LookupAnswer: Sized {
+    /// Return handles for all modules that are available for lookup. Handles
+    /// (rather than bare `ModuleName`s) are returned so callers can look a
+    /// module up by its known path rather than re-resolving it by name, which
+    /// can fail for modules whose name does not resolve via import (e.g. the
+    /// synthetic `__unknown__` module, or local files that shadow a package).
+    fn modules(&self) -> Vec<Handle>;
+
     /// Look up the value. If present, the `path` is a hint which can optimize certain cases.
     ///
     /// Return None if the file is undergoing concurrent modification.

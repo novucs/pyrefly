@@ -867,6 +867,49 @@ impl<'a> BindingsBuilder<'a> {
                 // `target::Exports`.
                 let special = self.as_special_export(&call.func);
                 let call_range = call.range;
+                // `SomeQuerySet.as_manager()` / `Manager.from_queryset(SomeQuerySet)`:
+                // synthesize a manager class (its base + methods resolve at solve time
+                // from the queryset) and bind it to the call's anon key. Whether the
+                // receiver is really a queryset is confirmed at solve time.
+                let manager_is_as_manager = if let Expr::Attribute(func_attr) = call.func.as_ref() {
+                    if func_attr.attr.id.as_str() == "as_manager"
+                        && call.arguments.args.is_empty()
+                        && call.arguments.keywords.is_empty()
+                    {
+                        Some(true)
+                    } else if func_attr.attr.id.as_str() == "from_queryset"
+                        && !call.arguments.args.is_empty()
+                    {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(is_as_manager) = manager_is_as_manager {
+                    let parent = self.scopes.nesting_context();
+                    let class_idx = if is_as_manager {
+                        let Expr::Attribute(func_attr) = &mut *call.func else {
+                            unreachable!("guard matched an attribute call")
+                        };
+                        self.synthesize_django_manager_def(&parent, &mut func_attr.value)
+                    } else {
+                        self.ensure_expr(&mut call.func, usage);
+                        for arg in call.arguments.args.iter_mut().skip(1) {
+                            self.ensure_expr(arg, usage);
+                        }
+                        for kw in call.arguments.keywords.iter_mut() {
+                            self.ensure_expr(&mut kw.value, usage);
+                        }
+                        self.synthesize_django_manager_def(&parent, &mut call.arguments.args[0])
+                    };
+                    self.insert_binding(
+                        Key::Anon(call_range),
+                        Binding::ClassDef(class_idx, Box::new([])),
+                    );
+                    return;
+                }
                 match special {
                     Some(
                         SpecialExport::CollectionsNamedTuple | SpecialExport::TypingNamedTuple,
@@ -1423,6 +1466,12 @@ impl<'a> BindingsBuilder<'a> {
     ) -> Vec<Idx<KeyDecorator>> {
         let mut decorator_keys = Vec::with_capacity(decorators.len());
         for mut x in decorators {
+            let decorator_func = x
+                .expression
+                .as_call_expr()
+                .map_or(&x.expression, |call| &call.func);
+            let is_class_metadata =
+                self.as_special_export(decorator_func) == Some(SpecialExport::ShapedArray);
             self.ensure_expr(&mut x.expression, usage);
             let trailing_name = Ast::decorator_trailing_name(&x.expression).map(Name::new);
             let k = self.insert_binding(
@@ -1430,6 +1479,7 @@ impl<'a> BindingsBuilder<'a> {
                 BindingDecorator {
                     expr: x.expression,
                     trailing_name,
+                    is_class_metadata,
                 },
             );
             decorator_keys.push(k);

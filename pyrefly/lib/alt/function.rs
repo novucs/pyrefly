@@ -14,6 +14,7 @@ use dupe::Dupe;
 use pyrefly_graph::index::Idx;
 use pyrefly_python::ast::Ast;
 use pyrefly_python::dunder;
+use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModuleStyle;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_types::callable::FuncId;
@@ -118,6 +119,19 @@ fn is_class_property_decorator_type(ty: &Type) -> bool {
         Type::ClassType(cls) => is_class_property_decorator_class_object(cls.class_object()),
         _ => false,
     }
+}
+
+/// Whether `ty` is factory_boy's `@post_generation` decorator. A method it
+/// decorates receives the generated model instance as `self` (not the factory),
+/// so an explicit `self: Model` annotation is correct and must be exempt from the
+/// self-annotation superclass check.
+fn is_factory_post_generation_decorator(ty: &Type) -> bool {
+    matches!(
+        ty.callee_kind(),
+        Some(CalleeKind::Function(FunctionKind::Def(func_id)))
+            if func_id.name.as_str() == "post_generation"
+                && func_id.module.name() == ModuleName::factory_helpers()
+    )
 }
 
 struct PreparedDecoratorApplication {
@@ -823,7 +837,12 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                         def.id_range(),
                         errors,
                     );
-                } else if !def.metadata.flags.is_staticmethod {
+                } else if !def.metadata.flags.is_staticmethod
+                    && !def
+                        .decorators
+                        .iter()
+                        .any(|(d, _)| is_factory_post_generation_decorator(d))
+                {
                     self.validate_self_annotation(
                         cls,
                         &stmt.name.id,
@@ -1814,6 +1833,60 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
         // from either the decoratee *or* the raw `decorated_value` make it into the final result
         // without either being wrapped in a `Forall` or converted to a gradual type.
         self.restore_decoratee_generics(decorated_value, application.decoratee_tparams)
+    }
+
+    pub(crate) fn apply_class_decorator(
+        &self,
+        decorator: Type,
+        decoratee: Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        if self.stdlib.is_bootstrapping() {
+            return decoratee;
+        }
+        let preserves_class = match &decorator {
+            Type::KwCall(call) => {
+                call.func_metadata
+                    .flags
+                    .dataclass_transform_metadata
+                    .is_some()
+                    || call.has_function_kind(FunctionKind::Dataclass)
+                    || call.has_function_kind(FunctionKind::DataclassTransform)
+                    || call.has_function_kind(FunctionKind::DisjointBase)
+                    || call.has_function_kind(FunctionKind::Final)
+                    || call.has_function_kind(FunctionKind::RuntimeCheckable)
+                    || call.has_function_kind(FunctionKind::TotalOrdering)
+            }
+            _ => decorator.visit_toplevel_func_metadata(&|meta| {
+                meta.flags.dataclass_transform_metadata.is_some()
+                    || matches!(
+                        meta.kind,
+                        FunctionKind::Dataclass
+                            | FunctionKind::DataclassTransform
+                            | FunctionKind::DisjointBase
+                            | FunctionKind::Final
+                            | FunctionKind::RuntimeCheckable
+                            | FunctionKind::TotalOrdering
+                    )
+            }),
+        };
+        if preserves_class {
+            return decoratee;
+        }
+        let call_target =
+            self.as_call_target_or_error(decorator, CallStyle::FreeForm, range, errors, None);
+        let arg = CallArg::ty(&decoratee, range);
+        let decorated = self.call_infer(call_target, &[arg], &[], range, errors, None, None, None);
+        // A decorator returning an unknown type or a plain callable (rather than a class) shouldn't
+        // erase the class identity; preserve the decoratee so member access still resolves.
+        if decorated.is_toplevel_callable()
+            || self.untype_opt(decorated.clone(), range, errors).is_some()
+        {
+            decoratee
+        } else {
+            decorated
+        }
     }
 
     /// For a type guard function, validate whether it has at least one

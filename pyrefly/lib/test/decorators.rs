@@ -10,6 +10,94 @@ use pyrefly_python::sys_info::PythonVersion;
 use crate::test::util::TestEnv;
 use crate::testcase;
 
+fn env_with_flask_typing_alias() -> TestEnv {
+    let mut env = TestEnv::new();
+    env.add(
+        "flask.typing",
+        r#"
+from __future__ import annotations
+import typing as t
+
+ResponseValue = t.Union[str, bytes]
+
+ResponseReturnValue = t.Union[
+    ResponseValue,
+    tuple[ResponseValue, int],
+    tuple[ResponseValue, int, dict[str, str]],
+]
+"#,
+    );
+    env.add(
+        "flask",
+        r#"
+from __future__ import annotations
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
+
+from flask.typing import ResponseReturnValue
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+class LoginManager:
+    def unauthorized(self) -> ResponseReturnValue: ...
+
+class App:
+    login_manager: LoginManager
+
+    def ensure_sync(self, func: Callable[P, R]) -> Callable[P, R]: ...
+
+current_app: App
+"#,
+    );
+    env.add(
+        "libs.login",
+        r#"
+from __future__ import annotations
+from collections.abc import Callable
+from functools import wraps
+from typing import ParamSpec, TypeVar
+
+from flask import current_app
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def login_required(func: Callable[P, R]):
+    @wraps(func)
+    def decorated_view(*args: P.args, **kwargs: P.kwargs):
+        if args:
+            return current_app.login_manager.unauthorized()
+        return current_app.ensure_sync(func)(*args, **kwargs)
+    return decorated_view
+"#,
+    );
+    env.add(
+        "controllers.console.wraps",
+        r#"
+from __future__ import annotations
+from collections.abc import Callable
+
+def setup_required(view: Callable[..., int]) -> Callable[..., int]: ...
+"#,
+    );
+    env.add(
+        "controllers.console.app.mcp_server",
+        r#"
+from __future__ import annotations
+
+from controllers.console.wraps import setup_required
+from libs.login import login_required
+
+@setup_required
+@login_required
+def handler(*args, **kwargs) -> int:
+    return 0
+"#,
+    );
+    env
+}
+
 testcase!(
     test_simple_function_decorator,
     r#"
@@ -441,6 +529,22 @@ g(f)
 );
 
 testcase!(
+    test_class_decorator_return_type_applied,
+    r#"
+from typing import reveal_type
+
+def to_int(cls: type) -> int:
+    return 42
+
+@to_int
+class C:
+    ...
+
+reveal_type(C)  # E: revealed type: int
+    "#,
+);
+
+testcase!(
     bug = "This error message is confusing, I think we need to be clearer when we are printing the *type* of an argument",
     test_decorator_error_message,
     r#"
@@ -451,6 +555,37 @@ def f0(arg: Callable[..., int]) -> Callable[..., int]: ...
 @dec  # E: Argument `int` is not assignable to parameter `arg` with type `(...) -> Any` in function `dec`
 @f0
 def f0(arg: Callable[..., int]) -> Callable[..., int]: ...
+    "#,
+);
+
+testcase!(
+    test_decorator_error_uses_external_union_alias,
+    env_with_flask_typing_alias(),
+    r#"
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
+
+from flask import current_app
+from flask.typing import ResponseReturnValue
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def login_required(func: Callable[P, R]) -> Callable[P, ResponseReturnValue | R]:
+    def decorated_view(*args: P.args, **kwargs: P.kwargs) -> ResponseReturnValue | R:
+        if args:
+            return current_app.login_manager.unauthorized()
+        return current_app.ensure_sync(func)(*args, **kwargs)
+    return decorated_view
+
+def setup_required(view: Callable[..., int]) -> Callable[..., int]: ...
+
+@setup_required  # E: Argument `(*args: Unknown, **kwargs: Unknown) -> ResponseReturnValue | R` is not assignable to parameter `view` with type `(...) -> int` in function `setup_required`
+@login_required
+def handler(*args, **kwargs) -> int:
+    return 0
     "#,
 );
 
@@ -728,6 +863,51 @@ def matmul(a: int, b: int, name: str | None = None) -> int:
 r = matmul(1, 2, name="test")
 assert_type(r, int)
     "#,
+);
+
+testcase!(
+    test_class_decorator_rebinds_class_value,
+    r#"
+class ActorHandle[T]:
+    def remote(self) -> T: ...
+    def options(self, num_cpus: int) -> "ActorHandle[T]": ...
+
+def remote[T](cls: type[T]) -> ActorHandle[T]:
+    return ActorHandle()
+
+@remote
+class Worker:
+    def compute(self) -> int:
+        return 42
+
+Worker.remote()
+Worker.options(num_cpus=2)
+"#,
+);
+
+testcase!(
+    test_class_decorator_preserves_class_for_unknown_or_callable_return,
+    r#"
+from typing import Any, Callable, assert_type
+
+def unknown_return[T](cls: type[T]) -> Any: ...
+def callable_return[T](cls: type[T]) -> Callable[[], T]: ...
+
+@unknown_return
+class UnknownDecorated:
+    def method(self) -> int:
+        return 1
+
+@callable_return
+class CallableDecorated:
+    def method(self) -> int:
+        return 2
+
+assert_type(UnknownDecorated, type[UnknownDecorated])
+assert_type(UnknownDecorated().method(), int)
+assert_type(CallableDecorated, type[CallableDecorated])
+assert_type(CallableDecorated().method(), int)
+"#,
 );
 
 fn env_numba() -> TestEnv {

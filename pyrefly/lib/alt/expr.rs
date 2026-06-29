@@ -89,6 +89,7 @@ use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 use crate::error::context::ErrorContext;
 use crate::error::context::TypeCheckContext;
+use crate::error::context::TypeCheckKind;
 use crate::solver::solver::CallContext;
 use crate::types::callable::Param;
 use crate::types::callable::ParamList;
@@ -278,12 +279,54 @@ pub(crate) const MAX_TUPLE_LENGTH: usize = 256;
 
 impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
     fn synthesized_functional_class_type(&self, call: &ExprCall) -> Option<Type> {
+        // Manager classes synthesized for `as_manager()`/`from_queryset()` are also
+        // bound to the anon key, but are handled by `django_manager_call` (which
+        // returns an instance for `as_manager`); skip them here.
+        if let Expr::Attribute(attr) = call.func.as_ref()
+            && (attr.attr.id == "as_manager" || attr.attr.id == "from_queryset")
+        {
+            return None;
+        }
         let anon_key = Key::Anon(call.range);
         let idx = self
             .bindings()
             .key_to_idx_hashed_opt(Hashed::new(&anon_key))?;
         matches!(self.bindings().get(idx), Binding::ClassDef(..))
             .then(|| self.get_hashed(Hashed::new(&anon_key)).ty().clone())
+    }
+
+    /// Type of `SomeQuerySet.as_manager()` / `Manager.from_queryset(SomeQuerySet)`,
+    /// using the manager class synthesized at bind time (bound to the call's anon key).
+    /// Returns an instance for `as_manager()` and the class object for `from_queryset()`,
+    /// or `None` when the receiver/argument isn't a Django queryset (so the call resolves
+    /// normally).
+    fn django_manager_call(&self, call: &ExprCall) -> Option<Type> {
+        let Expr::Attribute(attr) = call.func.as_ref() else {
+            return None;
+        };
+        let is_as_manager = attr.attr.id == "as_manager";
+        if !is_as_manager && attr.attr.id != "from_queryset" {
+            return None;
+        }
+        let anon_key = Key::Anon(call.range);
+        let idx = self
+            .bindings()
+            .key_to_idx_hashed_opt(Hashed::new(&anon_key))?;
+        if !matches!(self.bindings().get(idx), Binding::ClassDef(..)) {
+            return None;
+        }
+        let class_ty = self.get_hashed(Hashed::new(&anon_key)).ty().clone();
+        let Type::ClassDef(manager_cls) = &class_ty else {
+            return None;
+        };
+        // Only treat it as a manager if the base resolved to a real queryset.
+        self.get_metadata_for_class(manager_cls)
+            .django_manager_from_queryset()?;
+        if is_as_manager {
+            Some(self.instantiate(manager_cls))
+        } else {
+            Some(class_ty)
+        }
     }
 
     /// Infer a type for an expression, with an optional type hint that influences the inferred type.
@@ -679,6 +722,9 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
             Expr::YieldFrom(x) => self.get(&KeyYieldFrom(x.range)).return_ty.clone(),
             Expr::Compare(x) => self.compare_infer(x, errors),
             Expr::Call(x) => {
+                if let Some(ty) = self.django_manager_call(x) {
+                    return ty;
+                }
                 if let Some(ty) = self.synthesized_functional_class_type(x) {
                     return ty;
                 }
@@ -1369,24 +1415,67 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                 .any(|x| x.key.is_some() && !x.value.is_none_literal_expr());
             let mut key_tys = Vec::new();
             let mut value_tys = Vec::new();
+            let mut has_type_mismatch = false;
+            let check_items = hint
+                .filter(|hint| hint.errors().is_some())
+                .is_some_and(|hint| hint.types().len() == 1);
+            let infer_with_hint = |expr: &Expr, hint: Option<HintRef>, errors: &ErrorCollector| {
+                let ty = self.expr_infer_with_hint(expr, hint, errors);
+                match hint {
+                    Some(hint) => {
+                        let want = match hint.types() {
+                            [hint] => hint.clone(),
+                            hints => Type::union(hints.to_vec()),
+                        };
+                        let matches_hint = self.is_subset_eq(&ty, &want);
+                        let ty = if matches_hint {
+                            want
+                        } else {
+                            ty.promote_implicit_literals(self.stdlib)
+                        };
+                        (ty, matches_hint)
+                    }
+                    None => (ty.promote_implicit_literals(self.stdlib), true),
+                }
+            };
             items.iter().for_each(|x| match &x.key {
                 Some(key) => {
-                    let key_t = self.expr_infer_with_hint_promote(
-                        key,
-                        key_hint.as_ref().and_then(|key_hint| {
-                            hint.as_ref()
-                                .map(|hint| HintRef::new(key_hint, hint.errors()))
-                        }),
-                        errors,
-                    );
-                    let value_t = self.expr_infer_with_hint_promote(
-                        &x.value,
-                        value_hint.as_ref().and_then(|value_hint| {
-                            hint.as_ref()
-                                .map(|hint| HintRef::new(value_hint, hint.errors()))
-                        }),
-                        errors,
-                    );
+                    let key_hint_ref = key_hint.as_ref().and_then(|key_hint| {
+                        hint.as_ref()
+                            .map(|hint| HintRef::new(key_hint, hint.errors()))
+                    });
+                    let value_hint_ref = value_hint.as_ref().and_then(|value_hint| {
+                        hint.as_ref()
+                            .map(|hint| HintRef::new(value_hint, hint.errors()))
+                    });
+                    let (key_t, key_matches_hint) = infer_with_hint(key, key_hint_ref, errors);
+                    let (value_t, value_matches_hint) =
+                        infer_with_hint(&x.value, value_hint_ref, errors);
+                    if check_items
+                        && let Some(hint) = hint
+                        && let Some(check_errors) = hint.errors()
+                    {
+                        let tcc: &dyn Fn() -> TypeCheckContext =
+                            &|| TypeCheckContext::of_kind(TypeCheckKind::DictLiteralItem);
+                        if let Some(key_hint) = &key_hint
+                            && !key_matches_hint
+                        {
+                            self.check_type(&key_t, key_hint, key.range(), check_errors, tcc);
+                            has_type_mismatch = true;
+                        }
+                        if let Some(value_hint) = &value_hint
+                            && !value_matches_hint
+                        {
+                            self.check_type(
+                                &value_t,
+                                value_hint,
+                                x.value.range(),
+                                check_errors,
+                                tcc,
+                            );
+                            has_type_mismatch = true;
+                        }
+                    }
                     if !key_t.is_error() {
                         key_tys.push(key_t);
                     }
@@ -1433,6 +1522,43 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     } else if let Some((key_t, value_t)) = self.unwrap_mapping(&ty) {
                         // Non-anonymous-typed-dict unpacking disables anonymous typed dict creation
                         can_create_anonymous_typed_dict = false;
+                        let key_matches_hint = key_hint
+                            .as_ref()
+                            .is_some_and(|key_hint| self.is_subset_eq(&key_t, key_hint));
+                        let value_matches_hint = value_hint
+                            .as_ref()
+                            .is_some_and(|value_hint| self.is_subset_eq(&value_t, value_hint));
+                        if check_items
+                            && let Some(hint) = hint
+                            && let Some(check_errors) = hint.errors()
+                        {
+                            let tcc: &dyn Fn() -> TypeCheckContext =
+                                &|| TypeCheckContext::of_kind(TypeCheckKind::DictLiteralItem);
+                            if let Some(key_hint) = &key_hint
+                                && !key_matches_hint
+                            {
+                                self.check_type(
+                                    &key_t,
+                                    key_hint,
+                                    x.value.range(),
+                                    check_errors,
+                                    tcc,
+                                );
+                                has_type_mismatch = true;
+                            }
+                            if let Some(value_hint) = &value_hint
+                                && !value_matches_hint
+                            {
+                                self.check_type(
+                                    &value_t,
+                                    value_hint,
+                                    x.value.range(),
+                                    check_errors,
+                                    tcc,
+                                );
+                                has_type_mismatch = true;
+                            }
+                        }
                         if !key_t.is_error() {
                             if let Some(key_hint) = &key_hint
                                 && self.is_subset_eq(&key_t, key_hint)
@@ -1462,6 +1588,15 @@ impl<'a, Ans: LookupAnswer> AnswersSolver<'a, Ans> {
                     }
                 }
             });
+            if has_type_mismatch
+                && let Some(hint) = hint
+                && hint.errors().is_some()
+            {
+                return match hint.types() {
+                    [hint] => hint.clone(),
+                    hints => Type::union(hints.to_vec()),
+                };
+            }
             let any_field_has_open_placeholder = typed_dict_fields_map.values().any(|field| {
                 field
                     .ty

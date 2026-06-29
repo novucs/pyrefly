@@ -102,6 +102,7 @@ enum SynthesizedClassKind {
     TypedDict,
     NamedTuple,
     NewType,
+    DjangoManager,
 }
 
 /// Right-align `default_elts` into `defaults`: a slice of N elements makes the last N fields
@@ -388,7 +389,7 @@ impl<'a> BindingsBuilder<'a> {
             args.keywords.iter_mut().for_each(|keyword| {
                 if let Some(name) = &keyword.arg {
                     self.ensure_expr(&mut keyword.value, class_object.usage());
-                    keywords.push((name.id.clone(), keyword.value.clone()));
+                    keywords.push((name.clone(), keyword.value.clone()));
                 } else {
                     self.error(
                         keyword.range(),
@@ -453,6 +454,14 @@ impl<'a> BindingsBuilder<'a> {
         let django_field_info = self.extract_django_fields_from_class_body(&field_definitions);
         let mut fields = SmallMap::with_capacity(field_definitions.len());
         for (name, (definition, range)) in field_definitions.into_iter_hashed() {
+            let is_django_relation_candidate = matches!(
+                &definition,
+                ClassFieldDefinition::AssignedInBody { value, .. }
+                    if matches!(
+                        value.as_ref(),
+                        ExprOrBinding::Expr(expr) if expr.as_call_expr().is_some()
+                    )
+            );
             if let ClassFieldDefinition::AssignedInBody { value, .. } = &definition
                 && let ExprOrBinding::Expr(e) = value.as_ref()
             {
@@ -493,7 +502,10 @@ impl<'a> BindingsBuilder<'a> {
                 range,
                 definition,
             };
-            self.insert_binding(key_field, binding);
+            let field_idx = self.insert_binding(key_field, binding);
+            if is_django_relation_candidate {
+                self.record_django_relation_field(field_idx);
+            }
         }
 
         self.bind_current_as(
@@ -1143,7 +1155,7 @@ impl<'a> BindingsBuilder<'a> {
         class_indices: ClassIndices,
         parent: &NestingContext,
         base: Option<Expr>,
-        keywords: Box<[(Name, Expr)]>,
+        keywords: Box<[(Identifier, Expr)]>,
         // name, position, annotation, value
         member_definitions: Vec<(String, TextRange, Option<Expr>, Option<ExprOrBinding>)>,
         illegal_identifier_handling: IllegalIdentifierHandling,
@@ -1480,6 +1492,42 @@ impl<'a> BindingsBuilder<'a> {
         class_indices.class_idx
     }
 
+    /// Synthesize the anonymous manager class produced by
+    /// `SomeQuerySet.as_manager()` / `Manager.from_queryset(SomeQuerySet)`. It has no
+    /// declared members; its base (`Manager[Model]`) and grafted queryset methods are
+    /// computed at solve time from `qs_expr` (recorded in the synthesized base).
+    pub fn synthesize_django_manager_def(
+        &mut self,
+        parent: &NestingContext,
+        qs_expr: &mut Expr,
+    ) -> Idx<KeyClass> {
+        // Use the queryset expression's range for the class object's anon key so it
+        // doesn't collide with the call's anon key (which holds the `ClassDef` binding).
+        let class_name = Identifier::new(Name::new_static("Manager"), qs_expr.range());
+        let (mut class_object, class_indices) = self.anon_class_object_and_indices(&class_name);
+        // Attribute the queryset's usage to the synthesized class so it depends on it.
+        self.ensure_expr(qs_expr, class_object.usage());
+        let range = class_name.range();
+        self.synthesize_class_def(
+            class_name,
+            class_object,
+            class_indices.clone(),
+            parent,
+            None,
+            Box::new([]),
+            Vec::new(),
+            IllegalIdentifierHandling::Error,
+            false,
+            SynthesizedClassKind::DjangoManager,
+            Some(BaseClass::DjangoManagerFromQuerySet(
+                Box::new(qs_expr.clone()),
+                range,
+            )),
+            false,
+        );
+        class_indices.class_idx
+    }
+
     // This functional form allows specifying types for each element, but not default values
     pub fn synthesize_typing_named_tuple_def(
         &mut self,
@@ -1591,8 +1639,12 @@ impl<'a> BindingsBuilder<'a> {
                 (Some(name), _) if name == "extra_items" => Some(name),
                 _ => None,
             };
-            if let Some(kw_name) = recognized_kw {
-                base_class_keywords.push((kw_name.clone(), kw.value.clone()));
+            if recognized_kw.is_some() {
+                let kw_name = kw
+                    .arg
+                    .clone()
+                    .expect("recognized TypedDict keyword must have a name");
+                base_class_keywords.push((kw_name, kw.value.clone()));
             } else {
                 let msg = if let Some(name) = &kw.arg {
                     format!("Unrecognized keyword argument `{name}`")
